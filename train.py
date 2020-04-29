@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import pickle
 from sklearn.metrics import roc_auc_score
+from sklearn import metrics
 
 RANDOM_SEED = 1
 np.random.seed(RANDOM_SEED)
@@ -43,8 +44,8 @@ def get_batch(idx, batch_size, x, y, types, device):
       type_len = len(types[i])
   
   x_dim = len(x[0][0])
-  batch_x = np.zeros((batch_size, x_len, x_dim))
-  batch_type = np.zeros((batch_size, type_len)) - 1
+  batch_x = np.zeros((end-idx, x_len, x_dim))
+  batch_type = np.zeros((end-idx, type_len)) - 1
   batch_len = []
   for i in range(idx, end):
     batch_x[i-idx, :len(x[i]), :] = x[i]
@@ -59,8 +60,8 @@ def get_batch(idx, batch_size, x, y, types, device):
   
   return batch_x, batch_len, batch_type, batch_y
 
-batch_size = 128
-epochs = 100
+batch_size = 300
+epochs = 50
 lr=1e-3
 
 data_dim = 1823
@@ -111,38 +112,73 @@ for each_epoch in range(epochs):
     
     ehr_representation = lstm(batch_x, batch_len, device)
     loss, sv_loss, lpx_z, kld, inc_kld, kld2, pred, true = vae_objectives.objective(vae, c_model, device, x=ehr_representation, mask=batch_type, types=types, label=batch_y, beta=beta, nu=nu, K=1, kappa=1.0, components=True)
-    mean_auc = roc_auc_score(true.flatten(), pred.flatten())
-    loss.backward()
+    
+    loss.backward() 
     optimizer.step()
     
-    auc_his.append(mean_auc)
     loss_his.append(loss.cpu().detach().numpy())
     sv_his.append(sv_loss.cpu().detach().numpy())
     vae_his.append((lpx_z.cpu().detach().numpy(), kld.cpu().detach().numpy(), inc_kld.cpu().detach().numpy(), kld2.cpu().detach().numpy()))
     
-    if each_batch % (batch_size*1) == 0:
+    if each_batch % (batch_size*20) == 0:
       v_loss = - lpx_z + kld + inc_kld + kld2
-      print('Epoch %d, Batch %d, AUC: %.4f, Loss: %.4f, C-Loss: %.4f, V-Loss: %.4f'%(each_epoch, each_batch, mean_auc, loss.cpu().detach().numpy(), sv_loss.mean().cpu().detach().numpy(), v_loss.cpu().detach().numpy()))
+      print('Epoch %d, Batch %d, Loss: %.4f, C-Loss: %.4f, V-Loss: %.4f'%(each_epoch, each_batch, loss.cpu().detach().numpy(), sv_loss.mean().cpu().detach().numpy(), v_loss.cpu().detach().numpy()))
+      
+      tmp_roc = []
+      tmp_prc = []
+      for i in range(types):
+        cur_pred = np.array(pred)[:, i]
+        cur_true = np.array(true)[:, i]
+        if np.sum(cur_true) == 0:
+          continue
+        auroc = roc_auc_score(cur_true, cur_pred)
+        (precisions, recalls, thresholds) = metrics.precision_recall_curve(cur_true, cur_pred)
+        auprc = metrics.auc(recalls, precisions)
+        tmp_roc.append(auroc)
+        tmp_prc.append(auprc)
+      print('Mean AUROC: %.4f, AUPRC: %.4f\n'%(np.mean(tmp_roc), np.mean(tmp_prc)))
+
+    
     
     if each_batch % (batch_size*100) == 0:
       with torch.no_grad():
-        batch_x, batch_len, batch_type, batch_y = get_batch(each_batch, batch_size, valid_ehr, valid_label, valid_type, device)
         lstm.eval()
         vae.eval()
         c_model.eval()
         
-        ehr_representation = lstm(batch_x, batch_len, device)
-        loss, sv_loss, lpx_z, kld, inc_kld, kld2, pred, true = vae_objectives.objective(vae, c_model, device, x=ehr_representation, mask=batch_type, types=types, label=batch_y, beta=beta, nu=nu, K=1, kappa=1.0, components=True)
-        mean_auc = roc_auc_score(true.flatten(), pred.flatten())
+        loss_tmp_his = []
+        sv_tmp_his = []
+        vae_tmp_his = []
+        pred_his = []
+        true_his = []
         
-        auc_val_his.append(mean_auc)
-        loss_val_his.append(loss.cpu().detach().numpy())
-        sv_val_his.append(sv_loss.cpu().detach().numpy())
-        vae_val_his.append((lpx_z.cpu().detach().numpy(), kld.cpu().detach().numpy(), inc_kld.cpu().detach().numpy(), kld2.cpu().detach().numpy()))
-      
-        v_loss = - lpx_z + kld + inc_kld + kld2
-        print('Epoch %d, Batch %d, AUC: %.4f, Valid Loss: %.4f, C-Loss: %.4f, V-Loss: %.4f'%(each_epoch, each_batch, mean_auc, loss.cpu().detach().numpy(), sv_loss.mean().cpu().detach().numpy(), v_loss.cpu().detach().numpy()))
-    
+        for valid_batch in range(0, len(valid_ehr), batch_size):
+          batch_x, batch_len, batch_type, batch_y = get_batch(valid_batch, batch_size, valid_ehr, valid_label, valid_type, device)
+
+          ehr_representation = lstm(batch_x, batch_len, device)
+          loss, sv_loss, lpx_z, kld, inc_kld, kld2, pred, true = vae_objectives.objective(vae, c_model, device, x=ehr_representation, mask=batch_type, types=types, label=batch_y, beta=beta, nu=nu, K=1, kappa=1.0, components=True)
+          
+          pred_his+=list(pred)
+          true_his+=list(true)
+          loss_tmp_his.append(loss.cpu().detach().numpy())
+          sv_tmp_his.append(sv_loss.cpu().detach().numpy())
+          vae_tmp_his.append((lpx_z.cpu().detach().numpy(), kld.cpu().detach().numpy(), inc_kld.cpu().detach().numpy(), kld2.cpu().detach().numpy()))
+
+        loss_val_his.append(np.mean(loss_tmp_his))
+        sv_val_his.append(np.mean(sv_tmp_his))
+        vae_val_his.append(np.mean(np.array(vae_tmp_his), axis=0))
+        v_loss = -vae_val_his[-1][0]+vae_val_his[-1][1]+vae_val_his[-1][2]+vae_val_his[-1][3]
+        
+        print('Epoch %d, Batch %d, Valid Loss: %.4f, C-Loss: %.4f, V-Loss: %.4f'%(each_epoch, each_batch, loss_val_his[-1], sv_val_his[-1], v_loss))
+        for i in range(types):
+          cur_pred = np.array(pred_his)[:, i]
+          cur_true = np.array(true_his)[:, i]
+          auroc = roc_auc_score(cur_true, cur_pred)
+          (precisions, recalls, thresholds) = metrics.precision_recall_curve(cur_true, cur_pred)
+          auprc = metrics.auc(recalls, precisions)
+          print('Disease %d, AUROC: %.4f, AUPRC: %.4f'%(i+1, auroc, auprc))
+
+        
         if loss < min_loss:
           min_loss = loss
           state = {
